@@ -340,7 +340,21 @@ function extractGit(input: HookInput): SessionEvent[] {
   if (input.tool_name !== "Bash") return [];
 
   const cmd = String(input.tool_input["command"] ?? "");
-  const match = GIT_PATTERNS.find(p => p.pattern.test(cmd));
+
+  // Bug 8 (v1.0.162) — parse the git invocation algorithmically so flags
+  // between `git` and the operation token are tolerated (`git -C /path
+  // status`, `git --no-pager log`, etc.). Falls back to the legacy regex
+  // pattern scan when the algorithmic parse cannot locate a `git` token —
+  // preserves backward compat for commands like `cd /repo && git status`
+  // where the algorithmic parse sees `cd` as the first token instead.
+  const parsed = parseGitInvocation(cmd);
+  let match: { pattern: RegExp; operation: string } | undefined;
+  if (parsed && parsed.operation) {
+    match = GIT_PATTERNS.find(p => p.operation === parsed.operation);
+  }
+  if (!match) {
+    match = GIT_PATTERNS.find(p => p.pattern.test(cmd));
+  }
   if (!match) return [];
 
   // Bug 1 (v1.0.161) — for `git commit` operations, parse -m / -am / --message=
@@ -354,24 +368,125 @@ function extractGit(input: HookInput): SessionEvent[] {
   // rollup aggregator can distinguish ACTUAL commits from other git operations
   // (status/diff/log were inflating has_commit on every event — see
   // session-loaders.mjs rollup stamp + Bug 2).
+  // Bug 8 cwd hint — when `-C <dir>` is present in the git invocation, emit
+  // a leading cwd event so the attribution carry-forward (LAST_SEEN source)
+  // routes downstream events in the same batch to the scoped directory's
+  // project. Without the hint, `git -C /projB status` while cwd=/projA
+  // misattributes to /projA.
+  const out: SessionEvent[] = [];
+  if (parsed?.scopedDir) {
+    out.push({
+      type: "cwd",
+      category: "cwd",
+      data: safeString(parsed.scopedDir),
+      priority: 2,
+    });
+  }
+
   if (match.operation === "commit") {
     const msg = extractCommitMessageFromCommand(cmd);
     if (msg) {
-      return [{
+      out.push({
         type: "git_commit",
         category: "git",
         data: safeString(msg),
         priority: 2,
-      }];
+      });
+      return out;
     }
   }
 
-  return [{
+  out.push({
     type: "git",
     category: "git",
     data: safeString(match.operation),
     priority: 2,
-  }];
+  });
+  return out;
+}
+
+// Algorithmic git invocation parser — tokenizes the Bash command and walks
+// argv to extract the `-C <dir>` scope hint and the operation subcommand.
+// Tolerates env-prefix assignments and any number of flags between `git`
+// and the operation. Returns null when no `git` token is found (caller
+// falls back to the legacy regex pattern scan).
+interface ParsedGit {
+  scopedDir: string | null;
+  operation: string | null;
+}
+
+function parseGitInvocation(cmd: string): ParsedGit | null {
+  const tokens = tokenizeCommand(cmd);
+  let i = 0;
+  // Skip env-style assignments at the head (FOO=bar git ...)
+  while (i < tokens.length && isEnvAssignment(tokens[i])) i++;
+  // Locate the `git` token (allow common runners like `sudo git ...`)
+  while (i < tokens.length && tokens[i] !== "git" && !tokens[i].endsWith("/git")) {
+    // Stop runner-skipping at the first non-assignment, non-runner token
+    if (!isCommonRunner(tokens[i])) break;
+    i++;
+  }
+  if (i >= tokens.length) return null;
+  if (tokens[i] !== "git" && !tokens[i].endsWith("/git")) return null;
+  i++; // consume `git`
+
+  let scopedDir: string | null = null;
+  let operation: string | null = null;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === "-C" || t === "--directory") {
+      scopedDir = tokens[i + 1] ?? null;
+      i += 2;
+      continue;
+    }
+    if (t.length > 0 && t[0] === "-") {
+      // Generic flag — skip the flag itself. We do NOT consume the next
+      // token as its value generically because git's per-flag arg shape
+      // varies; the dedicated extractCommitMessageFromCommand handles -m
+      // separately.
+      i++;
+      continue;
+    }
+    // First bare (non-flag) token after `git` = operation
+    operation = t;
+    break;
+  }
+  return { scopedDir, operation };
+}
+
+function isEnvAssignment(token: string): boolean {
+  if (token.length === 0) return false;
+  // FOO=bar shape: starts with an uppercase letter, contains an `=`
+  let sawEq = false;
+  for (let j = 0; j < token.length; j++) {
+    const c = token.charCodeAt(j);
+    if (j === 0) {
+      // First char must be A-Z or underscore
+      if (!((c >= 65 && c <= 90) || c === 95)) return false;
+    } else if (c === 61 /* = */) {
+      sawEq = true;
+      break;
+    } else if (!((c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95)) {
+      // Body chars must be A-Z, 0-9, or _
+      return false;
+    }
+  }
+  return sawEq;
+}
+
+function isCommonRunner(token: string): boolean {
+  // Runners that wrap real commands. We skip them when locating `git`
+  // so `sudo git status` works the same as `git status`.
+  switch (token) {
+    case "sudo":
+    case "doas":
+    case "env":
+    case "exec":
+    case "time":
+      return true;
+    default:
+      return false;
+  }
 }
 
 // Shell-like argv tokenizer — handles single/double quotes, backslash escapes,
