@@ -319,17 +319,107 @@ interface PiRenderTheme {
 
 interface PiRenderContext {
   lastComponent?: unknown;
+  expanded?: boolean;
+}
+
+const EXPAND_HINT = " (expand for details)";
+
+type JsonRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is JsonRecord {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function scalar(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return undefined;
+}
+
+function renderArgs(args: unknown): string {
+  if (args == null) return "";
+  if (typeof args === "string") return args;
+  try {
+    return JSON.stringify(args, null, 2);
+  } catch {
+    return String(args);
+  }
+}
+
+function indentBlock(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) => `  ${line}`)
+    .join("\n");
+}
+
+function renderExpandedArgs(toolName: string, args: unknown): string {
+  if (!isRecord(args)) return renderArgs(args);
+
+  if ((toolName === "ctx_execute" || toolName === "ctx_execute_file") && typeof args.code === "string") {
+    const language = scalar(args.language) ?? "text";
+    return [`code(${language}):`, indentBlock(args.code)].join("\n");
+  }
+
+  return renderArgs(args);
+}
+
+function renderCollapsedSummary(toolName: string, args: unknown): string {
+  if (!isRecord(args)) return "";
+
+  if (toolName === "ctx_execute" || toolName === "ctx_execute_file") {
+    return [
+      scalar(args.language),
+      scalar(args.path) ? `path: ${scalar(args.path)}` : undefined,
+      scalar(args.intent),
+    ].filter(Boolean).join(" · ");
+  }
+
+  if (toolName === "ctx_batch_execute" && Array.isArray(args.commands)) {
+    return `${args.commands.length} command${args.commands.length === 1 ? "" : "s"}`;
+  }
+
+  if (toolName === "ctx_search" && Array.isArray(args.queries)) {
+    return `${args.queries.length} quer${args.queries.length === 1 ? "y" : "ies"}`;
+  }
+
+  return "";
 }
 
 function createContextModeCallRenderer(toolName: string) {
-  return (_args: unknown, theme: PiRenderTheme, context: PiRenderContext) => {
+  return (args: unknown, theme: PiRenderTheme, context: PiRenderContext) => {
     const text =
       context.lastComponent instanceof PiTextComponent
         ? context.lastComponent
         : new PiTextComponent();
-    text.setText(theme.fg("toolTitle", theme.bold(toolName)));
+    let content = theme.fg("toolTitle", theme.bold(toolName));
+    const summary = renderCollapsedSummary(toolName, args);
+    if (summary) content += ` ${theme.fg("dim", summary)}`;
+    content += theme.fg("dim", EXPAND_HINT);
+    if (context.expanded) {
+      const renderedArgs = renderExpandedArgs(toolName, args);
+      if (renderedArgs) content += `\n\n${theme.fg("toolOutput", renderedArgs)}`;
+    }
+    text.setText(content);
     return text;
   };
+}
+
+function stripLeadingCodeFence(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const firstContentIndex = lines.findIndex((line) => line.trim().length > 0);
+  if (firstContentIndex < 0 || !lines[firstContentIndex]?.trim().startsWith("```")) {
+    return text;
+  }
+
+  const closeIndex = lines.findIndex(
+    (line, index) => index > firstContentIndex && line.trim().startsWith("```"),
+  );
+  if (closeIndex < 0) return text;
+
+  let nextIndex = closeIndex + 1;
+  while (nextIndex < lines.length && lines[nextIndex]?.trim() === "") nextIndex++;
+  return lines.slice(nextIndex).join("\n");
 }
 
 function createContextModeResultRenderer(toolName: string) {
@@ -347,23 +437,19 @@ function createContextModeResultRenderer(toolName: string) {
       text.setText(theme.fg("warning", "indexing/searching..."));
       return text;
     }
-    const output = (result.content ?? [])
+    if (!expanded) {
+      text.setText("");
+      return text;
+    }
+    const rawOutput = (result.content ?? [])
       .filter((c) => c?.type === "text" && typeof c.text === "string")
       .map((c) => c.text as string)
       .join("\n");
-    if (expanded) {
-      text.setText(theme.fg("toolOutput", output));
-      return text;
-    }
-    const firstLine = output
-      .split(/\r?\n/)
-      .find((line) => line.trim().length > 0)
-      ?.trim();
-    const status =
-      firstLine && firstLine.length <= 180
-        ? firstLine
-        : `${toolName} completed`;
-    text.setText(theme.fg("toolOutput", status));
+    const output = (toolName === "ctx_execute" || toolName === "ctx_execute_file"
+      ? stripLeadingCodeFence(rawOutput)
+      : rawOutput
+    ).trim();
+    text.setText(output ? theme.fg("toolOutput", `result:\n${indentBlock(output)}`) : "");
     return text;
   };
 }
