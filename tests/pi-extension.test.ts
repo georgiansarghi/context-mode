@@ -1240,7 +1240,103 @@ describe("Pi MCP bridge (#426)", () => {
         expect(typeof reg.description).toBe("string");
         expect(reg.parameters).toBeTruthy();
         expect(typeof reg.execute).toBe("function");
+        expect(typeof reg.renderCall).toBe("function");
+        expect(typeof reg.renderResult).toBe("function");
       }
+    }, 30_000);
+
+    it("renders ctx_* calls compactly and expands arguments on demand", async () => {
+      const registered: any[] = [];
+      const fakePi = {
+        registerTool: (tool: any) => registered.push(tool),
+      };
+
+      const { bootstrapMCPTools } = await import("../src/adapters/pi/mcp-bridge.js");
+      bridge = await bootstrapMCPTools(fakePi, mcpEntry, { env: mcpEnv });
+
+      const execTool = registered.find((t) => t.name === "ctx_execute");
+      const batchTool = registered.find((t) => t.name === "ctx_batch_execute");
+      expect(execTool).toBeDefined();
+      expect(batchTool).toBeDefined();
+
+      const theme = {
+        bold: (text: string) => `<b>${text}</b>`,
+        fg: (color: string, text: string) => `[${color}]${text}[/]`,
+      };
+
+      const collapsed = execTool.renderCall(
+        { language: "javascript", code: "console.log('hi')", intent: "smoke" },
+        theme,
+        {},
+      ).render(200).join("\n");
+      expect(collapsed).toContain("ctx_execute");
+      expect(collapsed).toContain("javascript");
+      expect(collapsed).toContain("smoke");
+      expect(collapsed).toContain("expand for details");
+      expect(collapsed).not.toContain("console.log('hi')");
+      expect(collapsed).not.toContain("Ctrl+O");
+
+      const expanded = execTool.renderCall(
+        { language: "javascript", code: "console.log('hi')", intent: "smoke" },
+        theme,
+        { expanded: true },
+      ).render(200).join("\n");
+      expect(expanded).toContain("code(javascript):");
+      expect(expanded).toContain("console.log('hi')");
+
+      const batchCollapsed = batchTool.renderCall({ commands: [{}, {}] }, theme, {}).render(200).join("\n");
+      expect(batchCollapsed).toContain("2 commands");
+    }, 30_000);
+
+    it("renders ctx_* results only when expanded and strips execute code echo narrowly", async () => {
+      const registered: any[] = [];
+      const fakePi = {
+        registerTool: (tool: any) => registered.push(tool),
+      };
+
+      const { bootstrapMCPTools } = await import("../src/adapters/pi/mcp-bridge.js");
+      bridge = await bootstrapMCPTools(fakePi, mcpEntry, { env: mcpEnv });
+
+      const execTool = registered.find((t) => t.name === "ctx_execute");
+      const searchTool = registered.find((t) => t.name === "ctx_search");
+      expect(execTool).toBeDefined();
+      expect(searchTool).toBeDefined();
+
+      const theme = {
+        bold: (text: string) => `<b>${text}</b>`,
+        fg: (color: string, text: string) => `[${color}]${text}[/]`,
+      };
+      const result = {
+        content: [
+          {
+            type: "text",
+            text: "```javascript\nconsole.log('hi')\n```\n\nactual output",
+          },
+        ],
+      };
+
+      const collapsed = execTool.renderResult(result, { expanded: false, isPartial: false }, theme, {})
+        .render(200)
+        .join("\n");
+      expect(collapsed).toBe("");
+
+      const expandedExec = execTool.renderResult(result, { expanded: true, isPartial: false }, theme, {})
+        .render(200)
+        .join("\n");
+      expect(expandedExec).toContain("result:");
+      expect(expandedExec).toContain("actual output");
+      expect(expandedExec).not.toContain("console.log('hi')");
+
+      const expandedSearch = searchTool.renderResult(result, { expanded: true, isPartial: false }, theme, {})
+        .render(200)
+        .join("\n");
+      expect(expandedSearch).toContain("console.log('hi')");
+      expect(expandedSearch).toContain("actual output");
+
+      const partial = execTool.renderResult(result, { expanded: false, isPartial: true }, theme, {})
+        .render(200)
+        .join("\n");
+      expect(partial).toContain("indexing/searching");
     }, 30_000);
 
     it("execute() round-trips through tools/call to the MCP server", async () => {
